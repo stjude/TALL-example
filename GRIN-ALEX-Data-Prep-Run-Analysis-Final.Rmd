@@ -1,0 +1,820 @@
+---
+title: "GRIN2 Training"
+output: ioslides_presentation
+date: '2022-10-05'
+author: "Stan Pounds and Abdel Elsayed"
+---
+
+## Initial Set-up
+
+```{r,echo=T}
+rm(list=ls());              # start with clean slate in R
+options(stringsAsFactors=F) # turn off the most annonying default in R
+```
+
+## Initial Setup and Specify a directory on your local machine
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo=T,error=T,eval=T)
+# Specify a directory on your local machine
+knitr::opts_knit$set(root.dir = normalizePath("C:/Users/spounds/Box/BookChapterApril2022/GRIN-Training/"))
+```
+
+
+## Obtain Needed Packages
+
+```{r}
+#install.packages("readxl")
+#install.packages("writexl")
+#install.packages("circlize")
+
+# if (!require("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+# 
+# BiocManager::install("biomaRt")
+
+library(readxl)
+library(openxlsx)
+library(writexl)
+library(circlize)
+library(biomaRt)
+library(ComplexHeatmap)
+library(ggplot2)
+library(forcats)
+library(EnvStats)
+library(tidyverse)
+library(lubridate)
+library(GSDA)
+library(stringr)
+library(survival)
+library(dplyr)
+```
+
+## Obtain the GRIN2 Library (St. Jude GitHub repository)
+
+```{r}
+# load GRIN2.0-ALEX library 
+source("https://raw.githubusercontent.com/stjude/TALL-example/main/GRIN2.0.ALEX.library.09.29.2022.R")
+t0=proc.time()
+```
+
+## T-ALL Example Study
+
+>- [Genomic Landscape of T-ALL](https://pubmed.ncbi.nlm.nih.gov/28671688/)
+>- RNA-seq and WES data for 265 patients identified 6,887 genomic lesions
+>- Clinical outcome data
+
+## Download supplementary data for Liu et al (2017)
+
+```{r}
+# Download the data to the local directory directory
+ng.supp.link="https://static-content.springer.com/esm/art%3A10.1038%2Fng.3909/MediaObjects/41588_2017_BFng3909_MOESM2_ESM.xlsx"
+ng.supp.file=paste0(basename(ng.supp.link))
+
+download.file(ng.supp.link,
+              ng.supp.file,
+              mode="wb")
+```
+
+## Download the Clinical Data
+
+```{r}
+target.clin.link=paste0("https://target-data.nci.nih.gov/Public/",
+                        "ALL/clinical/Phase2/harmonized/",
+                        "TARGET_ALL_ClinicalData_Phase_II_Validation_20211118.xlsx")
+target.clin.file=paste0(basename(target.clin.link))
+
+download.file(target.clin.link,
+              target.clin.file,
+              mode="wb")
+```
+## Look at Downloaded Data
+
+>- Open the Excel files
+>- Sequence Mutations (NG Supplementary Table S8)
+>- Genomic Fusions (NG Supplementary Table S11)
+>- Genomic Copy Number Abnormalities (NG Supplementary Table S13)
+>- Clinical Data (NG Supplementary Table S1)
+>- RNA-Seq Data (NG Supplementary Table S5)
+>- TARGET Project Clinical Data 
+>- Patient Identifiers like PARZYZ
+
+## 1) Prepare the Clinical Data (merge)
+
+```{r}
+# Read the TARGET clinical data
+target.clin.data=read_xlsx(target.clin.file,sheet=1) 
+target.clin.data=as.data.frame(target.clin.data)     
+
+# Read the clinical data in the supplementary materials
+supp.clin.data=read_xlsx(ng.supp.file,sheet=1)       
+supp.clin.data=as.data.frame(supp.clin.data)         
+
+# Clean up the USI patient ID in the TARGET data
+target.clin.data$USI=gsub("TARGET-10-","",
+                          target.clin.data$`TARGET USI`,
+                          fixed=T)
+
+# Merge the two clinical data sets
+comb.clin.data=merge(target.clin.data,
+                     supp.clin.data,
+                     by="USI")
+
+```
+
+## Prepare the Clinical Data (clean up the column names after merging two files)
+
+```{r}
+# clean up the column names of the combined data set
+colnames(comb.clin.data)=gsub(".x","_TARGET",
+                              colnames(comb.clin.data),fixed=T)
+
+colnames(comb.clin.data)=gsub(".y","_supplement",
+                              colnames(comb.clin.data),fixed=T)
+
+colnames(comb.clin.data)=gsub("\r","",
+                              colnames(comb.clin.data),fixed=T)
+
+colnames(comb.clin.data)=gsub("\n","",
+                              colnames(comb.clin.data),fixed=T)
+
+colnames(comb.clin.data)=gsub(" ","_",                                                               colnames(comb.clin.data),fixed=T)
+```
+
+## Check Consistency Across Source Data
+
+```{r}
+all(comb.clin.data$Gender_supplement==
+      comb.clin.data$Gender_TARGET)
+
+table(paste(comb.clin.data$Race_TARGET,
+            comb.clin.data$Race_supplement,sep="_"))
+```
+
+
+## 2) Prepare Genomic Lesion Data
+
+Format Genomic Lesion Data like Table 1 of the GRIN Paper
+
+ID            | chrom  | loc.start  | loc.end   | lsn.type |
+--------------|--------|------------|-----------|----------|
+PARZYX        |  2     | 23748      | 37845     | gain     |
+PARZYX        |  7     | 137873     | 432813    | loss     |
+
+
+
+## List Spreadsheet Names
+
+```{r}
+# List of spreadsheet names
+supp.sheets=excel_sheets(ng.supp.file)
+supp.sheets
+```
+
+## Read Sequence Mutation Data
+
+```{r}
+SeqMut.data=read_xlsx(ng.supp.file,
+                      sheet="Table S8 Sequence mutations")
+SeqMut.data=as.data.frame(SeqMut.data)
+
+```
+
+## Prepare Sequence Mutation Data in a GRIN Compatible Format (SNVs and short indels)
+
+```{r}
+SeqMut.lsns=cbind.data.frame(ID=SeqMut.data$sample,
+                             chrom=gsub("chr","",SeqMut.data$chromosome), 
+                             loc.start=SeqMut.data$start,
+                             loc.end=SeqMut.data$start,
+                             lsn.type="mutation")
+
+head(SeqMut.lsns)
+```
+
+
+## Read Fusion and Copy Number Data
+
+```{r}
+# Read the fusion data
+fusion.data=read_xlsx(ng.supp.file,
+                      sheet="Table S11 fusions")
+fusion.data=as.data.frame(fusion.data)
+
+
+# Read the Copy Number Abnormality data
+CNA.data=read_xlsx(ng.supp.file,
+                   sheet="Table S13 CNA")
+CNA.data=as.data.frame(CNA.data)
+
+```
+
+
+## Prepare Fusion Data
+
+>- We represent fusions with each break-point as a separate point event (one row in the data set).
+>- Other ways may better capture the biology, but seem somewhat arbitrary and difficult to automate.
+
+## Prepare Fusion Data (two rows for each fusion)
+
+```{r}
+fusion.lsnsA=cbind.data.frame(ID=fusion.data$sample,
+                              chrom=gsub("chr","",fusion.data$chr_a),
+                              loc.start=fusion.data$position_a,
+                              loc.end=fusion.data$position_a,
+                              lsn.type="fusion")
+
+fusion.lsnsB=cbind.data.frame(ID=fusion.data$sample,
+                              chrom=gsub("chr","",fusion.data$chr_b),
+                              loc.start=fusion.data$position_b,
+                              loc.end=fusion.data$position_b,
+                              lsn.type="fusion")
+
+fusion.lsns=rbind.data.frame(fusion.lsnsA,
+                             fusion.lsnsB)
+```
+
+## Fusion Data
+
+```{r}
+head(fusion.lsns[2:6,])
+```
+
+## Prepare Copy Number Data (cutoffs for gain and loss based on log2_ratio)
+
+```{r}
+CNA.lsns=cbind.data.frame(ID=CNA.data$Case,
+                          chrom=CNA.data$Chromosome,
+                          loc.start=CNA.data$Start,
+                          loc.end=CNA.data$End,
+                          lsn.type="copy.number")
+
+CNA.lsns$lsn.type[CNA.data$log2_Ratio<(-0.2)]="loss"
+CNA.lsns$lsn.type[CNA.data$log2_Ratio>(+0.2)]="gain"
+
+CNA.lsns$chrom=as.character(CNA.lsns$chrom)
+CNA.lsns$chrom=gsub("23","X",CNA.lsns$chrom)
+CNA.lsns$chrom=gsub("24","Y",CNA.lsns$chrom)
+```
+
+## Prepare Copy Number Data
+
+```{r}
+head(CNA.lsns)
+```
+
+## Combine Genomic Lesion Data
+
+```{r}
+lsn.data=rbind.data.frame(SeqMut.lsns,
+                          fusion.lsns,
+                          CNA.lsns)
+
+table(lsn.data$lsn.type)
+
+```
+
+## 3) Obtain Genomic Annotations
+
+```{r}
+hg19.ann=get.ensembl.annotation("Human_GRCh37") 
+# "Human_GRCh38" can be used to retrieve data for hg38
+
+hg19.gene.annotation=hg19.ann$gene.annotation
+# Gene annotation data that include around 20,000 coding genes and 25,000 Non-coding processed 
+# transcripts such as lncRNAs, miRNAs, snRNA and snoRNAs
+
+hg19.reg.annotation=hg19.ann$reg.annotation
+# Annotation data for regulatory features retrieved from ensembl regulatory build that include 
+# around 600,000 feauters (promoters, enhancer, TF and CTCF binding sites, etc...)
+# Ensembl imports publicly available data from different large epigenomic consortia that includes 
+# ENCODE, Roadmap Epigenomics and Blueprint (118 epigenome)
+
+symbol_ensembl=cbind.data.frame(gene.name=hg19.gene.annotation$gene.name,
+                                gene=hg19.gene.annotation$gene)
+```
+
+
+## 4) Prepare RNA-Seq Data (log2 transformation)
+
+```{r}
+RNAseq.data=read_xlsx(ng.supp.file,
+                      sheet="Table S5 RNAseq FPKM")
+RNAseq.data=as.data.frame(RNAseq.data)
+rownames(RNAseq.data)=RNAseq.data[,1]
+RNAseq.data=RNAseq.data[,-1]
+RNAseq.data=as.matrix(RNAseq.data)
+RNAseq.data=log2(RNAseq.data+1)
+```
+
+## Prepare RNA-Seq Data (replace gene name by ensembl ID)
+
+```{r}
+RNAseq.data=round(RNAseq.data,3)
+RNAseq.data=cbind.data.frame(gene.name=rownames(RNAseq.data),
+                             RNAseq.data)
+
+RNAseq.data.final=merge(symbol_ensembl,RNAseq.data,
+                        by="gene.name", all.y=TRUE)
+RNAseq.data.final=RNAseq.data.final[,-1]
+```
+
+## Check  RNA-Seq Data
+
+```{r}
+row.has.na <- apply(RNAseq.data.final, 1, function(x){any(is.na(x))})
+sum(row.has.na)
+RNAseq.data.final <- RNAseq.data.final[!row.has.na,]
+
+```
+
+## Find and correct a few typos in SJTALL IDs
+
+```{r}
+RNAseq.clms=colnames(RNAseq.data.final)
+clin.RNAseq.IDs=comb.clin.data$RNAseq_id_D
+not.in.clin=setdiff(RNAseq.clms,clin.RNAseq.IDs)
+not.in.RNA=setdiff(clin.RNAseq.IDs,RNAseq.clms)
+comb.clin.data$RNAseq_id_D=gsub("SJTALL022433_D2",
+                                "SJTALL022433_D1",
+                                comb.clin.data$RNAseq_id_D)
+comb.clin.data$RNAseq_id_D=gsub("SJTALL171_E",
+                                "SJTALL171_D",
+                                comb.clin.data$RNAseq_id_D)
+RNAseq.clms=colnames(RNAseq.data.final)
+clin.RNAseq.IDs=comb.clin.data$RNAseq_id_D
+not.in.clin=setdiff(RNAseq.clms,clin.RNAseq.IDs)
+not.in.RNA=setdiff(clin.RNAseq.IDs,RNAseq.clms)
+comb.clin.data$RNAseq_id_D=gsub(not.in.RNA,"",
+                                comb.clin.data$RNAseq_id_D)
+```
+
+## Replace SJTALL IDs with USI IDs in RNAseq data to be consistent with lesion and clinical data files
+
+```{r}
+clin.IDs=comb.clin.data[,c("RNAseq_id_D","USI")]
+RNA.IDs=cbind.data.frame(RNAseq_id_D=colnames(RNAseq.data.final),
+                         clm.index=1:ncol(RNAseq.data.final))
+
+mtch.IDs=merge(clin.IDs,RNA.IDs,by=1)
+
+colnames(RNAseq.data.final)[mtch.IDs$clm.index]=mtch.IDs$USI
+```
+
+## Preview RNA-Seq Data
+
+```{r}
+dim(RNAseq.data.final)
+head(RNAseq.data.final[,1:5])
+```
+
+## Simplify Clinical Data Column Names
+
+```{r}
+ex.clin.data=comb.clin.data[,c("USI","Gender_TARGET",
+                               "Race_TARGET","Ethnicity",
+                               "Age_at_Diagnosis_in_Days",
+                               "Year_of_Diagnosis",
+                               "WBC_at_Diagnosis",
+                               "MRD_Day_29",
+                               "Event_Free_Survival_Time_in_Days",
+                               "First_Event",
+                               "Overall_Survival_Time_in_Days",
+                               "Vital_Status")]
+
+colnames(ex.clin.data)=c("ID","Sex","Race","Ethnicity",
+                         "Age_Days","Year_Dx",
+                         "WBC","MRD29",
+                         "Event_Days","First_Event",
+                         "OS_Days","Vital_Status")
+
+```
+
+## Define MRD and Overall Survival
+
+```{r}
+ex.clin.data$MRD.binary=ifelse(ex.clin.data$MRD29<0.1, 0,
+                        ifelse(ex.clin.data$MRD29>=0.1, 1, NA))
+
+ex.clin.data$os.time=ex.clin.data$OS_Days/365.25
+
+ex.clin.data$os.censor=ifelse(ex.clin.data$Vital_Status=="Alive", 0,
+                              ifelse(ex.clin.data$Vital_Status=="Dead", 1, NA))
+```
+
+## Define Event-Free Survival
+
+```{r}
+ex.clin.data$efs.time=ex.clin.data$Event_Days/365.25
+
+ex.clin.data$efs.censor=ifelse(ex.clin.data$First_Event=="Censored", 0,
+                        ifelse(ex.clin.data$First_Event=="None", 0,  
+                        ifelse(ex.clin.data$First_Event=="Relapse",1,
+                        ifelse(ex.clin.data$First_Event=="Second Malignant Neoplasm",1, 
+                        ifelse(ex.clin.data$First_Event=="Progression",1,
+                        ifelse(ex.clin.data$First_Event=="Death",1, NA))))))
+
+```
+
+
+## Save Data for Analysis
+
+```{r}
+TARGET.TALL.clin=ex.clin.data
+TARGET.TALL.lesion=lsn.data
+TARGET.TALL.expr=RNAseq.data.final
+hg19.gene.annotation=hg19.gene.annotation
+
+saveRDS(TARGET.TALL.clin, "TARGET.TALL.clin.RDS")
+saveRDS(TARGET.TALL.lesion, "TARGET.TALL.lesion.RDS")
+saveRDS(TARGET.TALL.expr, "TARGET.TALL.expr.RDS")
+saveRDS(hg19.gene.annotation, "hg19.gene.annotation.RDS")
+```
+
+## Retrieve chromosome size data from UCSC genome browser
+
+```{r}
+# To retrieve chromosome size data for GRCh37 (hg19) genome build from chr.info txt file 
+# available on UCSC genome browser
+hg19.chrom.size=get.chrom.length("Human_GRCh37")
+# "Human_GRCh38" can be used to retrieve chrom size data for hg38
+head(hg19.chrom.size)
+```
+
+## Run Genomic Random Interval (GRIN) Model
+
+```{r}
+GRIN.results=grin.stats(TARGET.TALL.lesion, 
+                        hg19.gene.annotation, 
+                        hg19.chrom.size)
+
+```
+
+## Write GRIN Results
+
+```{r}
+write.grin.xlsx(GRIN.results, "TALL2017-GRIN-result-sep2022.Seminar.xlsx")
+# write.grin.xlsx function return an excel file with multiple sheets
+```
+
+## Genome-wide Lesion Plot
+
+```{r}
+genomewide.plot=genomewide.lsn.plot(GRIN.results) 
+# This function use the list of GRIN.results
+
+```
+
+## Plots Showing Different Types of Lesions Affecting a Gene of Interest
+
+```{r}
+one.gene.plot=grin.gene.plot(GRIN.results, "MYB")
+```
+
+## Plots Showing Different Types of Lesions Affecting a Gene of Interest
+
+```{r}
+one.gene.plot=grin.gene.plot(GRIN.results, "WT1")
+```
+
+## Generate Regional Plots for Top Genes in GRIN Results
+
+```{r}
+pdf("GRIN-Gene-Plots-top25genes.pdf",width = 8,height = 6, onefile = TRUE) 
+#PDF to add lesion data plots, one gene per page
+top.grin.gene.plots(GRIN.results)
+dev.off()
+```
+
+## OncoPrint of Top Significant Genes in the GRIN Test
+
+```{r}
+oncoprint.genes = GRIN.results$gene.hits[GRIN.results$gene.hits$q2.nsubj < 0.01, ] 
+# specify cutoff for selected genes
+oncoprint.genes=oncoprint.genes[2] # extract gene name of selected genes
+oncoprint.genes=unlist(as.vector(oncoprint.genes))
+
+# Prepare matrix for selected genes with each row as a gene and each column is a patient
+oncoprint.mtx=grin.oncoprint.mtx(GRIN.results, oncoprint.genes)
+```
+
+## OncoPrint Matrix
+
+```{r}
+head(oncoprint.mtx[,1:5])
+```
+
+## Assign Colors and Specify some Characterstics for the OncoPrint
+
+```{r}
+# assign colour for each mutation type
+col = c("gain" = "red", "loss" = "blue", "mutation" = "olivedrab", "fusion" = "gold")
+
+# specify for each mutation type if the bar should take the whole or part of the cell, this is important if the same patient has gain and mutation for example
+alter_fun = list(
+  background = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0.00005, "pt"), h-unit(2, "pt"),
+              gp = gpar(fill = "#CCCCCC", col = NA))
+  },
+  # big red
+  gain = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(1, "pt"), h-unit(2, "pt"),     
+              gp = gpar(fill = col["gain"], col = NA))
+  },
+  # big blue
+  loss = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(1, "pt"), h-unit(2, "pt"),
+              gp = gpar(fill = col["loss"], col = NA))
+  },
+  # small green
+  mutation = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(1, "pt"), h*0.4,     # hx0.4 give small bars for mutations not to fill the whole cell. For example if the patient has mutation, gain both lesions will be represented
+              gp = gpar(fill = col["mutation"], col = NA))
+  },
+  # small gold
+  fusion = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(1, "pt"), h*0.4,
+              gp = gpar(fill = col["fusion"], col = NA))
+  }
+)
+
+```
+
+
+## Pass the Matrix of Selected Genes to OncoPrint Function
+
+```{r}
+column_title = "" # optional
+heatmap_legend_param = list(title = "Lesion Category", at = c("gain", "loss", "mutation", "fusion"),
+                            labels = c("Gain", "Loss", "Mutation", "Fusion"))
+# use oncoprint function from complexheatmap library to plot the oncoprint
+oncoPrint(oncoprint.mtx,
+          alter_fun = alter_fun, col = col,
+          column_title = column_title, heatmap_legend_param = heatmap_legend_param)
+```
+
+## OncoPrint of a List of Driver Genes
+
+```{r}
+oncoprint.genes=as.vector(c("ENSG00000148400", "ENSG00000171862",
+                            "ENSG00000156531", "ENSG00000162367", "ENSG00000139687",
+                            "ENSG00000138795", "ENSG00000184937", "ENSG00000127152","ENSG00000135363", "ENSG00000118513", "ENSG00000102974", "ENSG00000139083", "ENSG00000097007", "ENSG00000164438", "ENSG00000159216", "ENSG00000133703", "ENSG00000006468", "ENSG00000171843", "ENSG00000157554", "ENSG00000123473", "ENSG00000236311", "ENSG00000096968", "ENSG00000105639"))
+
+# Prepare matrix for selected genes with each row as a gene and each column is a patient
+oncoprint.mtx=grin.oncoprint.mtx(GRIN.results, oncoprint.genes)
+```
+
+
+## Pass the Matrix of Selected Genes to OncoPrint Function
+
+```{r}
+oncoPrint(oncoprint.mtx,
+          alter_fun = alter_fun, col = col,
+          column_title = column_title, heatmap_legend_param = heatmap_legend_param)
+```
+
+## OncoPrint of a Group of Genes in a List of Selected Pathways
+
+```{r}
+# Load pathways data file in which each group of genes are assigned to a certain pathway
+path.data.file="C:/Users/aelsa/Desktop/GRIN2-Article/GRIN-Seminar/data-prep/Pathways.csv"
+Pathways=read.csv(path.data.file)
+
+head(Pathways)
+```
+
+## Selected Pathways
+
+```{r}
+Bcell_Pathway=Pathways[Pathways$pathway=="Bcell_Pathway",]
+Bcell_ensembl=as.vector(Bcell_Pathway$ensembl.id)
+Jak_Pathway=Pathways[Pathways$pathway=="Jak_Pathway",]
+Jak_ensembl=as.vector(Jak_Pathway$ensembl.id)
+Ras_Pathway=Pathways[Pathways$pathway=="Ras_Pathway",]
+Ras_ensembl=as.vector(Ras_Pathway$ensembl.id)
+
+oncoprint.genes=c(Bcell_ensembl, Jak_ensembl, Ras_ensembl)
+```
+## Prepare OncoPrint Matrix
+
+```{r}
+oncoprint.mtx=grin.oncoprint.mtx(GRIN.results, oncoprint.genes)
+Gene=as.data.frame(rownames(oncoprint.mtx))
+colnames(Gene)="gene.name"
+Gene$index=1:nrow(Gene)
+merged.df=merge(Gene,Pathways, by="gene.name", all.x=TRUE)
+merged.df=merged.df[order(merged.df$index), ]
+
+sel.pathways=factor(merged.df$pathway,levels=c("Bcell_Pathway",
+                                           "Jak_Pathway","Ras_Pathway"))
+```
+
+
+## Pass the Matrix of Selected Genes to OncoPrint Function
+
+```{r}
+oncoPrint(oncoprint.mtx,
+          alter_fun = alter_fun, col = col,
+          column_title = column_title, heatmap_legend_param = heatmap_legend_param,
+          row_split=sel.pathways)
+```
+
+## Gene-Lesion Matrix for Association Analysis with Expression Data
+
+```{r}
+# Prepare gene and lesion data for later computations
+gene.lsn=prep.gene.lsn.data(TARGET.TALL.lesion, hg19.gene.annotation)    
+gene.lsn.overlap= find.gene.lsn.overlaps(gene.lsn)
+```
+
+## Prepare Gene-Lesion Matrix
+
+```{r}
+gene.lsn.type.mtx.atlest5=prep.lsn.type.matrix(gene.lsn.overlap, min.ngrp=5)
+# prep.lsn.type.matrix function return each gene in a row
+# min.ngrp can be used to specify the minimum number of patients with a lesion
+# to be included in the analysis
+```
+
+## Gene-Lesion Matrix
+
+```{r}
+head(gene.lsn.type.mtx.atlest5[,1:5])
+```
+## Associate Lesions with EXpression (ALEX)
+
+## Prepare Expression and Lesion Data for ALEX-KW Test and ALEX-plots
+
+```{r}
+alex.data=alex.prep.lsn.expr(TARGET.TALL.expr, TARGET.TALL.lesion,
+                             hg19.gene.annotation, min.pts.expr=5, min.pts.lsn=5)
+# order and keep only genes with lesion and expression data
+```
+## ALEX Lesion data
+
+```{r}
+alex.lsn=alex.data$alex.lsn
+head(alex.lsn[,1:5])
+```
+
+## ALEX Expression data
+
+```{r}
+alex.expr=alex.data$alex.expr
+head(alex.expr[,1:5])
+```
+
+## Run Kruskal-Wallis Test for Association between Lesion and Expression Data
+
+```{r}
+alex.kw.results=KW.hit.express(alex.data, hg19.gene.annotation, min.grp.size=5)
+write.csv(alex.kw.results, "alex.kw.results.final.csv")
+```
+
+## Boxplots Showing Expression Level by Lesion Groups for Top Significant Genes
+
+```{r}
+pdf("TALL2017-KW-q0.01-boxplots.pdf",width = 8,height = 5, onefile = TRUE) 
+# PDF to add boxplots, one gene per page
+alex.boxplots(alex.data, alex.kw.results, 0.00001, hg19.gene.annotation)
+dev.off()
+```
+
+## Prepare ALEX Data for Waterfall Plots
+
+```{r}
+CDKN2A.waterfall.prep=alex.waterfall.prep(alex.data, alex.kw.results, "CDKN2A", TARGET.TALL.lesion)
+CDKN2A.waterfall.plot=alex.waterfall.plot(CDKN2A.waterfall.prep, TARGET.TALL.lesion)
+```
+
+## Prepare ALEX Data for Waterfall Plots
+
+```{r}
+WT1.waterfall.prep=alex.waterfall.prep(alex.data, alex.kw.results, "WT1", TARGET.TALL.lesion)
+WT1.waterfall.plot=alex.waterfall.plot(WT1.waterfall.prep, TARGET.TALL.lesion)
+```
+
+## Prepare ALEX Data for Waterfall Plots
+
+```{r}
+JAK3.waterfall.prep=alex.waterfall.prep(alex.data, alex.kw.results, "JAK3", TARGET.TALL.lesion)
+JAK3.waterfall.plot=alex.waterfall.plot(JAK3.waterfall.prep, TARGET.TALL.lesion)
+```
+
+
+
+## Prepare ALEX Data for Waterfall Plots
+
+```{r}
+JAK2.waterfall.prep=alex.waterfall.prep(alex.data, alex.kw.results, "JAK2", TARGET.TALL.lesion)
+JAK2.waterfall.plot=alex.waterfall.plot(JAK2.waterfall.prep, TARGET.TALL.lesion)
+```
+
+## Waterfall Plots for Top Significant Genes in the KW Results Table
+
+```{r}
+top.genes.waterfall=top.alex.waterfall.plots(
+  "C:/Users/aelsa/Desktop/GRIN2-Article/GRIN_Training_Final/Test3/Waterfall_plots/",
+                                    alex.data, alex.kw.results, 0.00001, TARGET.TALL.lesion)
+```
+
+## Run Association Analysis between Lesion and Expression Data on the Pathway Level (JAK/STAT Pathway)
+
+```{r}
+alex.path=alex.pathway(alex.data,TARGET.TALL.lesion, Pathways, "Jak_Pathway")
+# to return ordered lesion and expression data of the genes assigned to the pathway of interest 
+write.csv(alex.path, "ordered-lesion-expression-data-JAK-pathway-genes.csv")
+```
+
+## Ordered Lesion and Expression Data based on the Clustering Analysis
+
+```{r}
+alex.path[1:9,1:5]
+```
+
+## Run Association Analysis between Lesion and Expression Data on the Pathway Level (RAS Pathway)
+
+```{r}
+alex.path.RAS=alex.pathway(alex.data,TARGET.TALL.lesion, Pathways, "Ras_Pathway")
+# to return ordered lesion and expression data of the genes assigned to the pathway of interest 
+write.csv(alex.path.RAS, "ordered-lesion-expression-data-pathway-genes.RAS.csv")
+```
+
+## Lesion Binary Matrix for Association Analysis with Clinical Outcomes
+
+```{r}
+# Prepare gene and lesion data for later computations
+gene.lsn=prep.gene.lsn.data(TARGET.TALL.lesion, hg19.gene.annotation)    
+gene.lsn.overlap= find.gene.lsn.overlaps(gene.lsn)
+```
+
+## Lesion Binary Matrix for Association Analysis with Clinical Outcomes
+
+```{r}
+lsn.binary.mtx.atleast5=prep.binary.lsn.mtx(gene.lsn.overlap, min.ngrp=5)
+## Each row is a lesion type that affect a certain gene (entry will be labelled as 
+# 1 if the patient is affected by by this type of lesion and 0 otherwise)
+# min.ngrp can be used to specify the minimum number of patients with a lesion
+# to be included in the analysis
+```
+
+## Gene-Lesion Matrix
+
+```{r}
+head(lsn.binary.mtx.atleast5[,1:5])
+```
+
+## Run Association Analysis for Lesions with Clinical Outcomes
+
+```{r}
+# extract lesion data for the first 100 genes in the lesion binary matrix (test)
+lsn.test=lsn.binary.mtx.atleast5[1:100,] 
+
+assc.outcomes=grin.assoc.lsn.outcome(lsn.test,
+                                     TARGET.TALL.clin,
+                                    hg19.gene.annotation,
+                                    mrd="MRD.binary", efs="efs.time",
+                                    efs.censor="efs.censor", os="os.time",
+                                    os.censor="os.censor")
+
+assoc.outcomes.df <- apply(assc.outcomes,2,as.character)
+write.csv(assoc.outcomes.df, "TALL.2017.Assoc.with.clinical.outcomes.csv")
+
+```
+
+## Evaluate CNVs (Gain and Deletions) as Boundaries 
+
+```{r}
+gain=TARGET.TALL.lesion[TARGET.TALL.lesion$lsn.type=="gain",]
+loss=TARGET.TALL.lesion[TARGET.TALL.lesion$lsn.type=="loss",]
+lsn.data.gain.loss=rbind(gain, loss)
+
+# To return lesion boundaries:
+lsn.bound.gain.loss=grin.lsn.boundaries(lsn.data.gain.loss, hg19.chrom.size)
+```
+
+## Lesion Boundaries
+
+```{r}
+head(lsn.bound.gain.loss[,1:5])
+```
+
+## Run GRIN analysis Using Lesion Boundaries Instead of the Gene Annotation File
+
+```{r}
+GRIN.results.CNV.bound=grin.stats(lsn.data.gain.loss, lsn.bound.gain.loss, hg19.chrom.size)
+write.grin.xlsx(GRIN.results.CNV.bound, "GRIN.results.CNV.boundaries.final.xlsx")
+```
+
+## Genome-wide Plot for Gain and Loss Boundaries
+
+```{r}
+grin.lsn.bound.plot(GRIN.results.CNV.bound, lsn.colors=c("gain" = "red", "loss" = "blue"))
+t1=proc.time()
+```
+
+## Total Computing Time (Minutes)
+
+```{r}
+(t1-t0)/60
+```
